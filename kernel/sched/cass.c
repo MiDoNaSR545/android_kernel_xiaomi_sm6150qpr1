@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2023-2024 Sultan Alsawaf <sultan@kerneltoast.com>.
+ * Copyright (C) 2023-2025 Sultan Alsawaf <sultan@kerneltoast.com>.
  */
 
 /**
@@ -33,6 +33,7 @@ struct cass_cpu_cand {
 	unsigned long eff_util;
 	unsigned long hard_util;
 	unsigned long util;
+	s64 eevdf_lag;
 };
 
 static __always_inline
@@ -60,8 +61,11 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	if (sync && c->cpu == this_cpu && !rt_task(current))
 		c->util -= min(c->util, task_util(current));
 
+	/* Initialize eevdf lag */
+	c->eevdf_lag = 0;
+
 	/* Get the utilization of everything other than CFS tasks */
-	c->hard_util = cpu_util_rt(c->cpu) + cpu_util_dl(rq) + cpu_util_irq(rq);
+	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
 
 	/*
 	 * Account for lost capacity due to time spent in RT/DL tasks and IRQs.
@@ -72,15 +76,25 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	c->cap = c->cap_max - min(c->hard_util, c->cap_max - 1);
 }
 
+/* EEVDF lag approximation for a candidate CPU. */
+static __always_inline
+void cass_compute_eevdf_lag(struct cass_cpu_cand *c, u64 se_vruntime)
+{
+	struct cfs_rq *cfs_rq = &cpu_rq(c->cpu)->cfs;
+	c->eevdf_lag = READ_ONCE(cfs_rq->avg_vruntime) - (s64)se_vruntime;
+}
+
 /* Returns true if @a is a better CPU than @b */
 static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     const struct cass_cpu_cand *b, unsigned long p_util,
-		     int this_cpu, int prev_cpu, bool sync)
+		     int this_cpu, int prev_cpu, bool sync, bool prefer_idle,
+		     s64 eevdf_lag_margin)
 {
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
+	unsigned long margin;
 
 	/* Prefer the CPU that's not overloaded */
 	if (cass_cmp(b->eff_util / b->cap_max, a->eff_util / a->cap_max))
@@ -101,12 +115,48 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 	if (cass_cmp(b->util, a->util))
 		goto done;
 
-	/* Prefer the CPU that is idle (only relevant for uclamped tasks) */
-	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
-		goto done;
+	/*
+	 * Prefer packing small, non-sync work on an active cpu over waking an idle
+	 * CPU, unless the active CPU is much worse.
+	 */
+	if (!prefer_idle && !!a->exit_lat != !!b->exit_lat) {
+		if (!a->exit_lat && b->exit_lat) {
+			if (a->eff_util <= a->cap_max &&
+			    a->util <= b->util + eevdf_lag_margin) {
+				res = 1;
+				goto done;
+			}
+		} else if (a->exit_lat && !b->exit_lat) {
+			if (b->eff_util <= b->cap_max &&
+			    b->util <= a->util + eevdf_lag_margin) {
+				res = -1;
+				goto done;
+			}
+		}
+	}
 
-	/* Prefer the current CPU for sync wakes */
-	if (sync && (cass_eq(a->cpu, this_cpu) || !cass_cmp(b->cpu, this_cpu)))
+	/*
+	 * Prefer the current CPU for sync wakes, but only if it isn't
+	 * substantially more overloaded than the alternative.
+	 */
+	if (sync) {
+		margin = SCHED_CAPACITY_SCALE / 20; /* 5% */
+
+		if (a->cpu == this_cpu) {
+			if (a->eff_util <= a->cap_max &&
+			    a->util <= b->util + margin &&
+			    cass_eq(a->cpu, this_cpu))
+				goto done;
+		} else if (b->cpu == this_cpu) {
+			if (b->eff_util <= b->cap_max &&
+			    b->util <= a->util + margin &&
+			    !cass_cmp(b->cpu, this_cpu))
+				goto done;
+		}
+	}
+
+	/* Prefer the CPU that is idle */
+	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
 		goto done;
 
 	/* Prefer the CPU with higher capacity */
@@ -136,9 +186,13 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 {
 	/* Initialize @best such that @best always has a valid CPU at the end */
 	struct cass_cpu_cand cands[2], *best = cands;
+	struct cfs_rq *cfs_rq;
 	int this_cpu = raw_smp_processor_id();
-	unsigned long p_util, uc_min;
+	unsigned long p_util, uc_min, eevdf_lag_margin;
 	bool has_idle = false;
+	u64 p_vruntime = 0;
+	s64 this_lag;
+	bool prefer_idle;
 	int cidx = 0, cpu;
 
 	/*
@@ -147,6 +201,26 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	 */
 	p_util = rt ? 0 : task_util_est(p);
 	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
+
+	/*
+	 * Prefer idle CPUs for sync wakes and for "heavy enough" work; otherwise,
+	 * prefer packing onto an already-active CPU.
+	 */
+	prefer_idle = sync || rt || uc_min || p_util >= (SCHED_CAPACITY_SCALE / 8);
+
+	if (!rt)
+		p_vruntime = READ_ONCE(p->se.vruntime);
+
+	eevdf_lag_margin = SCHED_CAPACITY_SCALE / 16;
+	if (!rt && !sync && !uc_min && p_util < (SCHED_CAPACITY_SCALE / 8)) {
+		cfs_rq = &cpu_rq(this_cpu)->cfs;
+		this_lag = READ_ONCE(cfs_rq->avg_vruntime) - (s64)p_vruntime;
+
+		if (this_lag < 0)
+			eevdf_lag_margin = SCHED_CAPACITY_SCALE / 8;
+		else if (this_lag > 0)
+			eevdf_lag_margin = SCHED_CAPACITY_SCALE / 32;
+	}
 
 	/*
 	 * Find the best CPU to wake @p on. Although idle_get_state() requires
@@ -166,7 +240,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		struct rq *rq = cpu_rq(cpu);
 
 		/* Get the original, maximum _possible_ capacity of this CPU */
-		curr->cap_max = arch_scale_cpu_capacity(NULL, cpu);
+		curr->cap_max = arch_scale_cpu_capacity(cpu);
 
 		/* Prefer the CPU that more closely meets the uclamp minimum */
 		if (curr->cap_max < uc_min && curr->cap_max < best->cap_max)
@@ -180,13 +254,14 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
 		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
 			/*
-			 * A non-idle candidate may be better when @p is uclamp
-			 * boosted. Otherwise, always prefer idle candidates.
+			 * A non-idle candidate may be better for energy
+			 * efficiency when @p is uclamp boosted above @curr's
+			 * minimum capacity, Otherwise, prefer idle candidates.
 			 */
-			if (!uc_min) {
+			if (!has_idle && prefer_idle &&
+			    uc_min <= arch_scale_min_freq_capacity(cpu)) {
 				/* Discard any previous non-idle candidate */
-				if (!has_idle)
-					best = curr;
+				best = curr;
 				has_idle = true;
 			}
 
@@ -199,7 +274,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 				curr->exit_lat += idle_state->exit_latency;
 		} else {
 			/* Skip non-idle CPUs if there's an idle candidate */
-			if (has_idle)
+			if (has_idle && prefer_idle)
 				continue;
 
 			/* Zero exit latency indicates this CPU isn't idle */
@@ -209,6 +284,9 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		/* Get this CPU's capacity and utilization */
 		curr->cpu = cpu;
 		cass_cpu_util(curr, this_cpu, sync);
+
+		if (!rt)
+			cass_compute_eevdf_lag(curr, p_vruntime);
 
 		/*
 		 * Add @p's utilization to this CPU if it's not @p's CPU, to
@@ -254,7 +332,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 */
 		if (best == curr ||
 		    cass_cpu_better(curr, best, p_util, this_cpu, prev_cpu,
-				    sync)) {
+				    sync, prefer_idle, eevdf_lag_margin)) {
 			best = curr;
 			cidx ^= 1;
 		}
